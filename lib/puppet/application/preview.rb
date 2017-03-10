@@ -31,7 +31,7 @@ class Puppet::Application::Preview < Puppet::Application
 
   option('--view OPTION') do |arg|
     arg = arg.gsub(/-/, '_')
-    if %w{overview overview_json summary diff baseline preview baseline_log preview_log none status
+    if %w{overview overview_json summary diff baseline preview general_log baseline_log preview_log none status
         failed_nodes diff_nodes equal_nodes compliant_nodes}.include?(arg)
       options[:view] = arg.to_sym
     else
@@ -175,7 +175,7 @@ class Puppet::Application::Preview < Puppet::Application
     end
 
     # Issue a deprecation warning unless JSON output is expected to avoid that the warning invalidates the output
-    if options.include?(:trusted) && ![:overview_json, :baseline_log, :preview_log].include?(options[:view])
+    if options.include?(:trusted) && ![:overview_json, :general_log, :baseline_log, :preview_log].include?(options[:view])
       Puppet.deprecation_warning('The --trusted option is deprecated and has no effect')
     end
 
@@ -206,7 +206,7 @@ class Puppet::Application::Preview < Puppet::Application
     else
       init_node_names_for_compile unless options[:last]
 
-      if node_names.size > 1 && [:diff, :baseline, :preview, :baseline_log, :preview_log].include?(options[:view])
+      if node_names.size > 1 && [:diff, :baseline, :preview, :general_log, :baseline_log, :preview_log].include?(options[:view])
         raise UsageError, "The --view option '#{options[:view].to_s.gsub(/_/, '-')}' is not supported for multiple nodes"
       end
 
@@ -259,6 +259,7 @@ class Puppet::Application::Preview < Puppet::Application
     nodes = @overview.nil? ? [] : @overview.of_class(OverviewModel::Node)
     @exit_code =  nodes.reduce(0) do |result, node|
       exit_code = node.exit_code
+      break exit_code if exit_code == GENERAL_ERROR
       break exit_code if exit_code == BASELINE_FAILED
       exit_code > result ? exit_code : result
     end
@@ -314,6 +315,10 @@ class Puppet::Application::Preview < Puppet::Application
           @latest_catalog_delta = catalog_delta
         else
           case @exit_code
+          when GENERAL_ERROR
+            display_log(options[:general_log])
+            log = read_json(node, :general_log)
+            factory.merge_failure(node, baseline_env, timestamp, @exit_code, log)
           when BASELINE_FAILED
             display_log(options[:baseline_log])
             log = read_json(node, :baseline_log)
@@ -337,6 +342,8 @@ class Puppet::Application::Preview < Puppet::Application
 
     begin
 
+      Puppet::Util::Log.close_all
+      Puppet::Util::Log.newdestination(options[:general_log].to_s)
       # Do the compilations and get the catalogs
       unless result = Puppet::Resource::Catalog.indirection.find(node, options)
         # TODO: Should always produce a result and give better error depending on what failed
@@ -374,6 +381,10 @@ class Puppet::Application::Preview < Puppet::Application
       end
 
       catalog_delta
+
+    rescue Puppet::Error => e
+      @exit_code = GENERAL_ERROR
+      @exception = e
 
     rescue PuppetX::Puppetlabs::Preview::BaselineCompileError => e
       @exit_code = BASELINE_FAILED
@@ -468,6 +479,8 @@ class Puppet::Application::Preview < Puppet::Application
     case options[:view]
     when :diff
       display_node_file(node, options[:catalog_diff])
+    when :general_log
+      display_node_file(node, options[:general_log], true)
     when :baseline_log
       display_node_file(node, options[:baseline_log], true)
     when :preview_log
@@ -483,7 +496,7 @@ class Puppet::Application::Preview < Puppet::Application
     # Produce output as directed by the :view option
     #
     case options[:view]
-    when :diff, :baseline_log, :preview_log, :baseline, :preview
+    when :diff, :general_log, :baseline_log, :preview_log, :baseline, :preview
       node_names.each do |node|
         prepare_output_options(node)
         view_node(node)
@@ -532,6 +545,7 @@ class Puppet::Application::Preview < Puppet::Application
     Puppet::FileSystem.chmod(0750, options[:node_output_dir])
 
     # Construct file name for this diff
+    options[:general_log]      = Puppet::FileSystem.pathname(File.join(node_output_dir, 'general_log.json'))
     options[:baseline_catalog] = Puppet::FileSystem.pathname(File.join(node_output_dir, 'baseline_catalog.json'))
     options[:baseline_log]     = Puppet::FileSystem.pathname(File.join(node_output_dir, 'baseline_log.json'))
     options[:preview_catalog]  = Puppet::FileSystem.pathname(File.join(node_output_dir, 'preview_catalog.json'))
@@ -544,6 +558,7 @@ class Puppet::Application::Preview < Puppet::Application
     prepare_output_options(node)
 
     # Truncate all output files to ensure output is not a mismatch of old and new
+    Puppet::FileSystem.open(options[:general_log], 0660, 'wb') { |of| of.write('') }
     Puppet::FileSystem.open(options[:baseline_log], 0660, 'wb') { |of| of.write('') }
     Puppet::FileSystem.open(options[:preview_log],  0660, 'wb') { |of| of.write('') }
     Puppet::FileSystem.open(options[:baseline_catalog], 0660, 'wb') { |of| of.write('') }
@@ -554,6 +569,7 @@ class Puppet::Application::Preview < Puppet::Application
     # make the log paths absolute (required to use them as log destinations).
     options[:preview_log]      = options[:preview_log].realpath
     options[:baseline_log]     = options[:baseline_log].realpath
+    options[:general_log]      = options[:general_log].realpath
   end
 
   def catalog_diff(node, timestamp, baseline_hash, preview_hash)
@@ -715,6 +731,8 @@ Output:
 
       compile_info = read_json(node, :compile_info)
       case compile_info['exit_code']
+      when GENERAL_ERROR
+        factory.merge_failure(node, compile_info['time'], '', 1, read_json(node, :general_log))
       when CATALOG_DELTA
         catalog_delta = CatalogDeltaModel::CatalogDelta.from_hash(read_json(node, :catalog_diff))
         factory.merge(catalog_delta, read_json(node, :baseline_log), read_json(node, :preview_log))
@@ -736,6 +754,8 @@ Output:
 
     colorizer = Colorizer.new
     case node.exit_code
+    when GENERAL_ERROR
+      out.puts colorizer.colorize(:hred, "Node #{node.name} had a general failure.")
     when BASELINE_FAILED
       out.puts colorizer.colorize(:hred, "Node #{node.name} failed baseline compilation.")
     when PREVIEW_FAILED
@@ -766,6 +786,7 @@ Output:
   end
 
   def terminate_logs
+    terminate_log(options[:general_log])
     terminate_log(options[:baseline_log])
     terminate_log(options[:preview_log])
   end
@@ -883,6 +904,8 @@ Output:
   def generate_stats
     @overview.of_class(OverviewModel::Node).reduce(Hash.new(0)) do | result, node |
       case node.exit_code
+      when GENERAL_ERROR
+        result[:general_error] += 1
       when BASELINE_FAILED
         result[:baseline_failed] += 1
       when PREVIEW_FAILED
@@ -946,6 +969,7 @@ Output:
 
 Summary:
   Total Number of Nodes...: #{@overview.of_class(OverviewModel::Node).length}
+  General Failed..........: #{stats[:general_error]}
   Baseline Failed.........: #{stats[:baseline_failed]}
   Preview Failed..........: #{stats[:preview_failed]}
   Catalogs with Difference: #{stats[:catalog_diff]}
